@@ -3,7 +3,7 @@
 **English** | [`中文`](README_CN.md)
 
 <p align="center">
-  <img src=".github/images/screenshot.png" alt="screenshot" width="80%" />
+  <img src=".github/images/poster.png" alt="poster" width="80%" />
 </p>
 
 Thanks to [Cris.Q](https://crisq.top/blog/deveco_linux_porting_notes) for the original porting notes that inspired this project.
@@ -12,74 +12,137 @@ This is an Arch Linux PKGBUILD that packages DevEco Studio (Huawei's IDE for Har
 
 It is not an official package. It is not endorsed by Huawei or JetBrains.
 
+## Status
+
+Everything works except the previewer. If you find any problems, file an issue.
+
+If Huawei ships a native Linux build, this project will be archived.
+
+> [!NOTE]  
+> If you plan to use this project, reading the full README is strongly recommended; the collapsed sections are optional reading as needed.
+
 ## Building
 
-Always check `PKGBUILD` yourself.
+Always check `PKGBUILD` yourself before using.
 
-For the tested, release-quality version (of PKGBUILD),
-use a tagged release — the default branch may carry untested changes:
+<details>
+<summary><b>Build locally (any distro)</b></summary>
+<br><table><thead><tr><td>
 
-    git checkout <latest-tag>
-
-(replace `<latest-tag>` with the newest tag, e.g. `26.0.0.621-7` — list
-them with `git tag`).
-
-The version in the tag is the `pkgver` in that PKGBUILD — i.e. the DevEco
-Studio version you should download below (e.g. `26.0.0.621`).
-
-### Locally with makepkg
-
-You will need to manually download two files from Huawei's website:
+First, download two files from Huawei's website:
 
 1. **DevEco Studio ${pkgver} for Mac**
 2. **Command Line Tools for Linux (x86_64) ${pkgver}**
 
-Place both `.zip` files next to the PKGBUILD, **renamed** to the fixed
-filenames the PKGBUILD expects — `devecostudio-mac.zip` and
-`commandline-tools-linux-x64.zip` (the names are version-independent).
-Then:
+Place both `.zip` files next to the PKGBUILD, **renamed** to `devecostudio-mac.zip` and
+`commandline-tools-linux-x64.zip`.
+
+    # Clone the repo
+    git clone https://github.com/alex3236/devecostudio-linux.git
+    cd devecostudio-linux
+
+    # Checkout latest tag (skip if you accept untested changes)
+    git fetch --tags
+    git checkout $(git describe --tags $(git rev-list --tags --max-count=1))
+
+What to do next depends on your distro:
+
+<details>
+<summary><b>I'm on Arch Linux</b></summary>
+<br><ul>
 
     makepkg -si
 
-The IntelliJ IDEA tarball is fetched automatically from JetBrains' CDN.
+The two Huawei zips are not checksum-verified (`SKIP` in `sha256sums`): their
+download URLs are signed and short-lived, and Huawei republishes the same
+version with different bytes. The IDEA and CPython tarballs are verified; if
+one of those reports a mismatch, update the sums with:
 
-The version in `pkgver` and its SHA256 checksums are what the author tested.
-To use a different version:
+    updpkgsums
 
-1. Check the PKGBUILD for the expected filenames (they don't contain a version, so you only rename your downloads once),
-2. Download the version you want, rename it to the fixed filenames, then update `pkgver` and the two SHA256 checksums (or set them to `"SKIP"` if you'd rather skip verification),
-3. You can also change `_ideaver` for a different IDEA base.
+</ul>
+</details>
 
-Only the versions in `pkgver` have been tested — if you modify them, test
-the result yourself.
+<details>
+<summary><b>I'm on another distro</b></summary>
+<br><ul>
 
-### With GitHub Actions
+You will need these dependencies:
 
-If you don't have an Arch machine at hand, the same build can be run in
-GitHub Actions:
+    bsdtar or unzip, jq, python3, curl, binutils, patchelf
 
-1. **Fork** this repository (the workflow is triggered manually), or use your own fork of it.
-2. Open the **Actions** tab, select the **Build DevEco Studio PKGBUILD** workflow and click **Run workflow**.
+To also build .deb/.rpm packages:
+
+    nfpm, gettext
+
+Then:
+
+    # Show the build script's help
+    ./build.sh -h
+
+    # Example: build the tarball
+    ./build.sh
+
+    # Example: build the tarball and an rpm package
+    ./build.sh --rpm
+
+Note: the two Huawei zips are not checksum-verified at all; IDEA and CPython
+are, from the PKGBUILD's `sha256sums`.
+
+</ul>
+</details>
+
+</td></tr></thead></table>
+</details>
+
+
+<details>
+<summary><b>Build online (GitHub Actions)</b></summary>
+<br><table><thead><tr><td>
+
+The same build can be run in GitHub Actions:
+
+1. **Fork** this repository.
+2. Open the **Actions** tab, select **Build DevEco Studio PKGBUILD** and click **Run workflow**.
 3. Optionally, "Use workflow from" a tagged release.
-4. Fill in the two download URLs (Huawei links expire, so you need fresh ones from the [download page](https://developer.huawei.com/consumer/cn/deveco-studio/) each time):
+4. Fill in the two download URLs:
    - `mac_zip_url` — URL of the Mac zip
    - `cli_zip_url` — URL of the Linux Command Line Tools zip
-5. Optionally override the version and checksums (leave empty to keep the values in `PKGBUILD`):
-   - `pkgver` — e.g. `6.1.1.280`
-   - `mac_zip_sha256` / `cli_zip_sha256` — SHA256 of the two zips; use `SKIP` to skip verification for an untested version
-6. When the run finishes, download the `devecostudio-pkg` artifact from the run page and install it locally:
-
-       sudo pacman -U devecostudio-*.pkg.tar.zst
+5. Optionally override `pkgver` (leave empty to keep the value in `PKGBUILD`).
+6. Choose which artifacts to build — unchecking one shortens the run, and
+   `.rpm` in particular adds the 16 GB swapfile and the slowest step:
+   - `make_arch`, `make_deb`, `make_rpm`, `make_tarball` (all on by default)
+7. When the run finishes, download the artifact matching your platform:
+   - `devecostudio-arch` — Arch package
+   - `devecostudio-deb` — Debian/Ubuntu package
+   - `devecostudio-rpm` — Fedora/RHEL package
+   - `devecostudio-tarball` — for any other distro
 
 A GitHub account can use Actions for free on public repositories.
 
-### On other distributions
+</td></tr></thead></table>
+</details>
 
-The workflow also produces a distro-agnostic tarball
-(`devecostudio-<ver>-linux-x86_64.tar.gz`) containing the complete
-`/opt/devecostudio` tree plus `devecostudio.desktop` at the root. On
-Debian/Ubuntu/Fedora or any other Linux, extract it and set up the launcher
-manually:
+## Installing
+
+This package targets Arch Linux (the makepkg build); the `.deb`/`.rpm`
+builds cover Debian 12+ / Ubuntu 22.04+ and Fedora / RHEL; the tarball
+works on any Linux.
+
+    # Arch
+    sudo pacman -U devecostudio-*.pkg.tar.zst
+
+    # Debian / Ubuntu
+    sudo apt install ./devecostudio_*.deb
+
+    # Fedora / RHEL
+    sudo dnf install ./devecostudio-*.rpm
+
+<details>
+<summary><b>Other distros (via tarball)</b></summary>
+<br><table><thead><tr><td>
+
+Extract the tarball and set up the launcher manually:
 
     sudo tar -xzf devecostudio-<ver>-linux-x86_64.tar.gz -C /opt
     sudo ln -s /opt/devecostudio/bin/devecostudio.sh /usr/local/bin/devecostudio
@@ -87,39 +150,93 @@ manually:
 
 You also need the runtime dependencies (package names vary by distro):
 `libxss`, `libxtst`, `nss`, `alsa-lib`, `libxcrypt-compat`, `freetype2`,
-`libpulse`. Chinese input support needs `fcitx5`. Unlike the Arch package,
-the bundled CLI tools are not linked into `/usr/bin` — call them by full
-path under `/opt/devecostudio/tools/bin/`.
+`libpulse`, `bzip2`. Chinese input support needs `fcitx5`. Unlike the Arch
+package, the bundled CLI tools are not linked into `/usr/bin` — call them
+by full path under `/opt/devecostudio/tools/bin/`.
 
-## CLI tools on PATH
+</td></tr></thead></table>
+</details>
+
+## Usage
+
+Launch DevEco Studio with whatever you are familiar with (start menu / dock / command line).
+
+### CLI tools on PATH
 
 The IDE needs the bundled Huawei command-line tools at runtime, and they
 also work standalone from a terminal. By default the package symlinks them
 into `/usr/bin`:
 
-| `/usr/bin` entry | Tool | Note |
-|---|---|---|
-| `devecostudio` | IDE launcher | always installed |
-| `hvigorw` | build tool | Huawei-specific name, exposed as-is |
-| `ohpm` | package manager | Huawei-specific name, exposed as-is |
-| `hstack` | toolchain helper | Huawei-specific name, exposed as-is |
-| `hcodelinter` | code linter | prefixed with `h` to avoid collisions |
-| `hemulator` | emulator CLI | prefixed with `h` to avoid collisions |
+- Always exposed: `devecostudio`, `hdc`
+- Exposed by default: `hvigorw`, `ohpm`, `hstack`, `hcodelinter`, `hemulator`, `harktsdoc`;
+
+`Emulator`, `codelinter` and `arktsdoc` are prefixed to avoid possible
+collisions.
+
+<details>
+<summary><b>Adjusting the symlink behavior</b></summary>
+<br><table><thead><tr><td>
 
 Both behaviors are controlled by variables at the top of the PKGBUILD:
 
-- `_expose_cli_tools=true` — set to `false` to keep the tools out of
-  `/usr/bin` entirely (they stay under `/opt/devecostudio/tools/bin/` and
-  can still be called by full path).
-- `_hprefix_generic_tools=true` — set to `false` to drop the `h` prefix
-  and expose `codelinter` / `Emulator` under their original names (which
-  may collide with other packages).
+- `_expose_cli_tools=true`
+    - If set to `false`, the by-default exposed commands are not symlinked into `/usr/bin`
+    - They are still callable by full path under `/opt/devecostudio/tools/bin/`
+- `_hprefix_generic_tools=true`
+    - If set to `false`, no `h` prefix is added; `codelinter` and `Emulator` are exposed under their original names
 
-## Emulator
+Both only apply to the Arch package. The `/usr/bin` links in the `.deb` and
+`.rpm` are declared statically in `nfpm.yaml` — always the `h`-prefixed
+names — and the tarball ships no `/usr/bin` links at all.
+
+</td></tr></thead></table>
+</details>
+
+### Extra SDKs (older versions)
+
+The bundled SDK is HarmonyOS 26.0.0 (Release). An older SDK (e.g. 6.1.1
+Release) can be installed alongside and used per project — useful for
+reproducing issues or building against an older API level.
+
+<details>
+<summary><b>How?</b></summary>
+<br><table><thead><tr><td>
+
+1. Download the corresponding CLI tools package;
+2. Install the SDK into the IDE directory with the following command:
+    ```shell
+    # Install SDK from a Huawei CLI zip (needs sudo)
+    sudo /opt/devecostudio/bin/install-extra-sdk.sh /commandline-tools-linux-x64-6.1.1.280.zip
+    ```
+
+3. Set the compile SDK in your project:
+    ```json5
+    "compileSdkVersion": "6.1.1(24)",
+    "targetSdkVersion": "6.1.1(24)"
+    ```
+
+</td></tr></thead></table>
+
+Installing an older SDK also patches two things so it can actually be used:
+hvigor's `compileSdkVersion` validation and the IDE's project-sync check
+(both are hardwired to the bundled SDK version). A default install stays
+pristine; the patches are applied by `install-extra-sdk.sh` and re-applied
+automatically when the package is upgraded while an extra SDK is present.
+
+Note: source code using API 26-only interfaces (e.g. newer camera APIs)
+will not compile against 6.1.1 — adjust or guard the code accordingly.
+</details>
+
+### Emulator
 
 The emulator works, but before first use you must accept the software
-agreements and
-download the system images. For example:
+agreements and download a system image. The IDE's Device Manager lists the
+cloud images (non-public HarmonyOS images need a Huawei account signed in);
+the command line downloads them anonymously.
+
+<details>
+<summary><b>How?</b></summary>
+<br><table><thead><tr><td>
 
     # List available images
     hemulator -imageList
@@ -136,17 +253,27 @@ download the system images. For example:
 Once installed, you can create, manage and start emulators from the
 IDE's Device Manager.
 
-## Previewer
+</td></tr></thead></table>
+</details>
+
+### DevEco CLI
+
+With Huawei's DevEco CLI, you and your AI Agent can effortlessly handle project initialization, building, signing, and debugging, alongside documentation lookup.
+
+This project provide environment support for DevEco CLI. Simply set `DEVECO_CLI_STUDIO_PATH=/opt/devecostudio`.
+
+### Previewer
 
 The previewer is unavailable. Huawei has not yet ported the Rosen
 rendering engine to Linux.
 
-## What happens under the hood
+This also means `hvigorw test` (local unit tests run through the previewer)
+cannot pass. It should fails within seconds.
 
-The PKGBUILD extracts the Mac DMG and takes the platform-independent parts
-— JARs, plugins, modules. The SDK and CLI tools (hvigor, ohpm, node,
-emulator, …) come from Huawei's Linux Command Line Tools instead. Then the
-macOS-specific bits (launcher, JBR, native libraries) are replaced with
+## How does this work?
+
+The PKGBUILD extracts the Mac DMG and takes the platform-independent parts,
+then replaces the macOS-specific bits (launcher, JBR, native libraries) with
 their Linux counterparts from IntelliJ IDEA. The vmoptions and
 product-info.json are transformed on the fly so the IDE knows it's running
 on Linux.
@@ -160,14 +287,9 @@ installer is an `.exe` that is hard to extract, and the packaged version
 lags behind in updates. The Mac DMG is trivially extractable and contains
 all the cross-platform files we need.
 
-The only truly platform-specific things we swap out are:
-- The Java runtime (JBR) — macOS → Linux
-- The native launcher binary (and `fsnotifier`)
-- Shared libraries (.so files)
-- The SDK and CLI tools — taken from the Linux Command Line Tools
-
-Everything else — the Java code, plugins, templates — is
-platform-independent.
+<details>
+<summary><b>Component details</b></summary>
+<table><thead><tr><td>
 
 ### The emulator
 
@@ -179,12 +301,9 @@ distinguishes Mac from non-Mac, and the non-Mac branch hardcodes the
 Device Manager and debugging. The package fixes this with a symlink:
 `Emulator.exe -> Emulator` in `tools/emulator/`.
 
-Second, system images must be downloaded manually because of how the
-official installer works: when the emulator is missing, its wizard downloads
-the binary *and* the system image together. Since this package bundles the
-binary, the IDE thinks the emulator is installed and never offers the
-wizard, leaving the system image as the only missing piece — see the
-Emulator section above for how to get one.
+Second, the Device Manager lists the cloud system images — the IDE is
+patched to report `osType` `windows` to Huawei's server, which is what
+Huawei's own Linux CLI emulator does too.
 
 Third, the emulator's software agreements: the IDE launches the emulator
 binary directly, and if the agreements were never accepted it waits
@@ -230,13 +349,18 @@ You can also set the scale manually via the IDE's *Help → Edit Custom VM
 Options*. For more, see [the IDEA HiDPI
 documentation](https://intellij-support.jetbrains.com/hc/en-us/articles/360007994999-HiDPI-configuration).
 
-### Some magic
+</td></tr></thead></table>
+</details>
 
 For the sake of brevity, you can check [DETAILS.md](DETAILS.md) to learn about other magic used in this project.
 
 ## License situation
 
 This project is not affiliated with or endorsed by Huawei.
+
+<details>
+<summary><b>Terms, redistribution and component licenses</b></summary>
+<br><table><thead><tr><td>
 
 DevEco Studio is a commercial product owned by Huawei. Before using it, you agree to the HUAWEI DevEco Studio User Agreement (reproduced in LICENSE.huawei). A few clauses worth noting:
 
@@ -264,3 +388,6 @@ They are not part of DevEco Studio and carry no restrictions from Huawei's terms
 - JetBrains Runtime (JBR) is GPLv2 with the classpath exception, based on OpenJDK.
 - IntelliJ IDEA Community components are available under Apache 2.0.
 - Various third-party libraries bundled with DevEco Studio carry their own licenses.
+
+</td></tr></thead></table>
+</details>

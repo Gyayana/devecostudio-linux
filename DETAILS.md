@@ -11,7 +11,7 @@ view; this is the developer-facing view.
 |---|---|---|
 | **Mac DMG** (`devecostudio-mac.zip`) | `lib/*.jar`, `plugins/`, `modules/`, `license/`, `build.txt`, `bin/devecostudio.svg`, `bin/idea.properties`, `bin/devecostudio.vmoptions`, `Resources/product-info.json`, `tools/UxTestService` | Huawei ships DevEco Studio for Windows, macOS, and Linux. The Windows installer is an `.exe` that is painful to extract and lags in version; the Mac DMG extracts trivially with `7z x` and all of these files are platform-independent (Java bytecode, resources, templates). |
 | **JetBrains IDEA tarball** (`idea-${_ideaver}.tar.gz`) | `jbr/`, `bin/idea` launcher, `bin/fsnotifier`, `lib/native/linux-x86_64/`, `lib/pty4j/linux/`, `lib/jna/amd64/`, `lib/skiko-awt-runtime-all/` | The macOS-specific bits (JBR, launcher, native `.so`s) are replaced with Linux ones. DevEco's build number is pinned to a specific IDEA baseline — see "IDEA version matching" below. |
-| **Command Line Tools for Linux** (`commandline-tools-linux-x64.zip`) | `sdk/`, `tool/node/`, `hvigor/`, `ohpm/`, `hstack/`, `codelinter/`, `emulator/`, `bin/` wrappers | The CLI zip already contains Linux-native versions of every tool, and its SDK is the one the IDE needs. |
+| **Command Line Tools for Linux** (`commandline-tools-linux-x64.zip`) | `sdk/`, `tool/node/`, `hvigor/`, `ohpm/`, `hstack/`, `codelinter/`, `emulator/`, `arktsdoc/`, `bin/` wrappers | The CLI zip already contains Linux-native versions of every tool, and its SDK is the one the IDE needs. |
 
 Everything from the Mac DMG that is not on the list above is either
 platform-native (and unusable on Linux) or duplicated by the CLI: `jbr`,
@@ -22,8 +22,10 @@ platform-native (and unusable on Linux) or duplicated by the CLI: `jbr`,
 The two Huawei zips are **user-supplied** (Huawei's download links are
 signed and expire), renamed to version-independent filenames
 (`devecostudio-mac.zip`, `commandline-tools-linux-x64.zip`). Only the IDEA
-tarball is auto-downloaded. Checksums live in `sha256sums`; users changing
-versions update `pkgver` + the two checksums (or use `SKIP`).
+tarball is auto-downloaded. The two Huawei zips are `'SKIP'` in `sha256sums`
+(signed, expiring links; Huawei also re-issues the same version with
+different bytes), so a new version only needs `pkgver`; the IDEA and CPython
+tarballs keep real sums.
 
 ## The magic, by area
 
@@ -40,14 +42,86 @@ Two consequences of the symlink:
 - The `.exe` cleanup pass must keep it: `find "$_pkg" -name '*.exe' -not -name 'Emulator.exe' -delete`. (A past bug deleted it; it only existed locally because it had been created by hand.)
 - The emulator binary itself comes from the **CLI** zip (Linux ELF), not the Mac DMG (Mach-O).
 
+### Emulator bzip2 soname (`libbz2.so.1.0` -> `libbz2.so.1`)
+
+The emulator binary and its bundled `libavformat.so` were linked against the
+Debian-style bzip2 soname `libbz2.so.1.0`. Fedora, RHEL and openEuler ship
+`bzip2-libs` whose soname is `libbz2.so.1`, so there the emulator dies with
+`error while loading shared libraries: libbz2.so.1.0` — and because the IDE
+queries the emulator every second for the device list and the Device Manager,
+the device list stays empty instead of showing an error.
+
+`libbz2.so.1` exists on Debian (`libbz2-1.0`), Fedora (`bzip2-libs`) and Arch
+(`bzip2`) alike, so `package()` retargets both objects with
+`patchelf --replace-needed libbz2.so.1.0 libbz2.so.1` and then asserts the new
+name with `patchelf --print-needed`. The retarget is done at build time rather
+than by an install hook for two reasons: the distro-agnostic tarball has no
+install hooks at all, and a symlink created inside `/opt/devecostudio` by a
+postinstall script is unowned by the package and would also run on removal
+(the same script is wired to both `postinstall` and `postremove` in
+`nfpm.yaml`). `patchelf` is therefore a build dependency, and `bzip2` is a
+runtime dependency of the Arch package (the deb/rpm equivalents are
+`libbz2-1.0` / `bzip2-libs` in `nfpm.yaml`).
+
+Unrelated but adjacent fragility: the package ships `libavformat.so` without a
+versioned name while its SONAME is `libavformat.so.61`, so `libavdevice.so` and
+`libavfilter.so` can only resolve it from the host's ffmpeg. The normal emulator
+start path does not load them, but a host whose ffmpeg major differs would
+break the media pipeline.
+
 ### Emulator system images
 
 The IDE's "install emulator" wizard only appears when the emulator binary
 is missing, and downloads binary **and** system image together. Because we
-bundle the binary, the wizard never triggers — system images are the only
-missing piece and must be fetched manually:
-`Emulator -install -deviceType phone -osVersion "<version>"` (anonymous),
-or copied from another platform's install into `~/.Huawei/Sdk/system-image/`.
+bundle the binary, the wizard never triggers. The images themselves are listed
+in the Device Manager (see the next section for why that works on Linux);
+without touching the IDE they can be fetched anonymously with
+`Emulator -install -deviceType phone -osVersion "<version>"`, or copied from
+another platform's install into `~/.Huawei/Sdk/system-image/`.
+
+### Emulator cloud image list (`osType` bent to `windows`)
+
+Huawei's remote SDK manager (`POST .../sdkmanager/v9/hos/getSdkList`) returns
+an empty list for `osType: "linux"` and the full image set for `"windows"`.
+The IDE builds that parameter through `SdkSettings.getOsType()`, whose default
+method body is literally `invokestatic OsTypeUtil.getOsType()`, on the class in
+`plugins/openharmony/lib/sdk-core-*.jar`. That method maps `os.name` to
+`mac` / `windows` / `linux` / `other` through constant-pool strings.
+`scripts/patch-emulator-list.py` rewrites its Linux branch (`ldc #31`,
+"linux", followed by `areturn`) to return the "windows" constant instead. That
+is exactly what Huawei's own Linux CLI emulator does: the binary carries
+`windows` immediately before the `osType` request field.
+
+Three constraints the patcher is built around:
+
+- **Only the sdk-core copy is patched.** `lib/hwlib.jar` ships a second
+  `OsTypeUtil.getOsType()` whose callers are `DevEcoUpdateCheckerService` (the
+  update checker) and `projectmgmt`'s `RenderHashMap`, which does
+  `putIfAbsent("osType", ...)` and so feeds `windows` into the project-template
+  renderer. Bending that copy would make the IDE pretend to be Windows to the
+  update server and inject `windows` into generated project files, for no
+  benefit: the whole SDK-manager chain (`SdkSettings`,
+  `AbstractRemoteComponentLoader`, `InstallTaskImpl`,
+  `OhRemoteComponentLoader`, `ARKUIXRemoteComponentLoader`) resolves to the
+  sdk-core class.
+- **Constant-pool indices are resolved, not hardcoded.** `#31`/`#27` are
+  incidental to the class layout, so the patcher parses the pool, finds the
+  `String` entries for "linux" and "windows", and handles both `ldc` and
+  `ldc_w`. It exits non-zero when the expected shape is absent, so an upstream
+  reshuffle fails the build instead of shipping a silent no-op.
+- **x86_64 only.** The images are x86_64 QEMU guests, so the patcher skips any
+  tree whose `tools/emulator/Emulator` is not `EM_X86_64` - a non-x86_64 IDE
+  would otherwise list images it cannot boot.
+
+One side effect is worth knowing: the same utility serves every SDK-manager
+request, so with the patch in place the **SDK Manager sees the Windows
+component list**. Install additional SDKs the way `install-extra-sdk.sh` does
+(from Huawei's commandline-tools zip) rather than through the IDE's SDK
+Manager.
+
+Verified on 26.0.0.851: `getOsType()` returns `windows` from the patched jar
+(`linux` from the pristine one), and the Device Manager lists the cloud
+images.
 
 ### Emulator paths (`~/Library/Huawei/Sdk`)
 
@@ -116,6 +190,51 @@ fails to load `libshared_libz.so` / `libhilog.so` — the CLI ships
 `libhilog_linux.so` and no zlib shim — but adding those only gets the
 engine to the point where it prints "Linux is not supported".)
 
+### `hvigorw test` hung forever (fixed in the package)
+
+`hvigorw test` (local unit tests) never finished: it printed
+`Finished :entry:default@UnitTestArkTS` and then nothing, forever. The
+cause is hvigor's test driver, not our packaging —
+`tools/hvigor/hvigor-ohos-plugin/node_modules/@ohos/coverage/lib/src/commandLine/localTest/previewer.js`,
+`executeCoverageTest()`:
+
+- it resolves its promise **only** when the Previewer prints a completion
+  marker on stdout (`OHOS_REPORT_STATUS: taskconsuming`,
+  `The AbilityDelegator.finishTest`, …) —
+  `isShouldKillPreviewer()`'s first check is the constant
+  `'[Engine Log]Error message:'`, which the stub's line does not match;
+- `child.on('close')` only deletes the port — it never rejects;
+- `stderr` is never read and there is no timeout.
+
+On Linux the Previewer can never produce a marker (it dies on the missing
+`libshared_libz.so`, or, with the libraries supplied, prints
+`Linux is not supported` and returns **without exiting**), so the promise
+never settles and hvigor waits silently.
+
+`scripts/patch-previewer.py` (run from `package()`, so every build since
+26.0.0.851-2 carries it) leaves the success path untouched and adds only
+failure paths: child exit → reject, spawn failure → reject, stderr
+forwarded to the logger, the `Linux is not supported` line → reject with an
+actionable message, plus a `DEVECO_PREVIEWER_TIMEOUT_MS` backstop
+(default 120 s). The `error`/`close`-only fix would still wait for the
+timeout; the marker check is what makes it instant.
+
+Measured by calling `executeCoverageTest()` directly with the real `.test`
+artifacts of a project:
+
+| scenario | result |
+|---|---|
+| Previewer missing a shared library (exit 127) | **0.24 s**, rejects; the loader error is now visible (it used to be swallowed) |
+| libraries supplied → `Linux is not supported` | **0.69 s**, rejects with the "run instrumented tests instead" hint |
+
+Trap found while verifying: the first version of the patch rejected
+without `child.kill()`/`unref()`. The marker fired immediately, but the
+orphaned Previewer kept Node's event loop alive, so the run still took the
+full 120 s. `_prevFail()` now kills and unrefs the child.
+
+A pattern miss only warns (upstream may reshape the file) — re-verify on
+every new hvigor.
+
 ### Node.js layout (three symlinks, no real-file copy)
 
 The CLI's `tool/node/` is the upstream node tarball layout: real binaries
@@ -167,9 +286,10 @@ The CLI zip's `bin/` wrappers (`hvigorw`, `ohpm`, `hstack`, `codelinter`,
 
 ### /usr/bin exposure
 
-`devecostudio` always links to the wrapper. The five CLI tools are exposed
-only if `_expose_cli_tools=true`; `hvigorw`/`ohpm`/`hstack` use their
-original names (Huawei-specific, unlikely to collide), while
+`devecostudio` always links to the wrapper. `hdc` is also always linked
+(from the SDK toolchains; it is a plain ELF, not a wrapper). The five CLI
+tools are exposed only if `_expose_cli_tools=true`; `hvigorw`/`ohpm`/`hstack`
+use their original names (Huawei-specific, unlikely to collide), while
 `codelinter`/`Emulator` get an `h` prefix (`hcodelinter`, `hemulator`)
 unless `_hprefix_generic_tools=false`. Toggle both at the top of the
 PKGBUILD.
@@ -243,6 +363,9 @@ skips the injection and leaves scaling to the JVM.
 
 Mac DMG files ship 700; `cp -a` preserves that, so the package does a
 global `chmod 755` on dirs and `644` on files, then restores exec bits.
+The chmods use `find -exec chmod {} +` (batched), not the per-file `{} \;`
+form — with ~130k files the per-file form forks a process per file and is
+the slowest part of the build.
 The exec-bit restore uses **Python reading the first 256 bytes** (ELF
 magic `\x7fELF`, or a shebang `#!` anywhere in the head — some CLI scripts
 put a copyright comment before the shebang, notably `hstack`). The `file`
@@ -265,6 +388,101 @@ is deliberately **not** stripped (contains cross-compiled ARM binaries).
 `plugins/` — a blanket delete previously removed real SDK content
 (`llvm/bin/lldb.sh`, cmake `Squish*.sh`).
 
+### Bundled python is macOS-only (appanalyzer)
+
+The Mac DMG ships a full python under `plugins/app-analyzer/lib/python/`
+(Mach-O
+binaries plus `com.apple.cs.CodeSignature` xattr sidecar files — proof it
+was never meant for Linux). The IDE's appanalyzer (`hos-app-analyzer` jar)
+uses it for venv/pip:
+
+- `PathUtil.getInnerPythonHome()` → `<IDE>/plugins/app-analyzer/lib/python/bin`
+- `PythonConfigUtil.PYTHON_COMMAND` → `python3`
+- `createVenv` runs `<bin>/python3 -m venv --clear <venv>` — execve
+  refuses Mach-O, so venv creation always failed with Huawei's misleading
+  "check the venv directory permissions / is it locked" message. The venv
+  parent dir is actually user-writable
+  (`PathManager.getSystemPath()/caches/appanalyzer/pythonconfig`).
+- `AllowedPython.VERSION_NUMBER` is parsed dynamically from
+  `python3 --version`, but falls back to a hardcoded `3.12.10` when the
+  probe fails — which it always does, because `getRealPythonPath()` returns
+  a **file** path while `findRealPythonDir()` expects a directory. So the
+  venv dir name is effectively pinned to `python_3.12.10`.
+
+The fix replaces the whole `bin/ lib/ include/ share/` tree with a real
+Linux CPython **3.12.10** from python-build-standalone
+(astral-sh, MIT; `cpython-3.12.10+20250409-...-install_only.tar.gz` is a
+automatic source with a pinned checksum). The version must stay exactly
+3.12.10: the appanalyzer jar only ships requirements resources for
+`python/3.11/` and `python/3.12/`, and `getLocalRequirements` reads
+`/python/<minor>/requirements_internal.json` — a 3.14 interpreter produced
+`/python/3.14/...` → resource missing → `localRequirements == null` → NPE
+in `PipLibraryDownloadUtil.getPipLibraryDownloaded`. `python` sits in
+`makedepends` (the exec-bit restore script needs a system interpreter), not
+`depends` (the IDE never runs the system python).
+
+### appanalyzer requirements path case mismatch
+
+`initRequirements()` writes `requirements/python_3.12.10/requirements.json`
+(`AllowedPython.getFileName()` = `python_%s`), but `getPipLibraryDownloaded`
+reads `requirements/Python_3.12.10/requirements.json` — the version string
+comes from `python3 --version` output (`"Python 3.12.10"`) with spaces
+replaced by `_`. Case-insensitive filesystems (macOS/Windows, where Huawei
+tests) treat these as the same file; Linux does not, so the read fails,
+`parseProcess(null)` returns null, and every appanalyzer run dies with the
+`localRequirements is null` NPE. The launcher bridges the two names with a
+symlink (`Python_<ver> → python_<ver>`) and seeds `requirements.json` from
+the jar's `python/3.12/requirements_external.json` when missing.
+
+The seeding jar's filename carries the DevEco version
+(`hos-app-analyzer-<pkgver>.jar`), so the launcher **globs** it
+(`hos-app-analyzer-[0-9]*.jar`) rather than naming it — a hardcoded
+`…-26.0.0.821.jar` silently seeded a **0-byte** file on 26.0.0.851 (the
+rename to `-26.0.0.851.jar`), and because the check is `[[ ! -s ]]` it then
+retried and failed on every launch. The seed now also writes to a temp file
+and only `mv`s on success, so a failed extraction leaves nothing behind,
+and it creates the `python_<ver>/` directory itself (Huawei normally does,
+but the wrapper runs before appanalyzer's first launch too, and a missing
+directory used to spam a redirect error on every start).
+
+### appanalyzer torch scenario
+
+Torch-related analysis works, with two upstream bugs worked around: (1) the
+requirements pin `torchvision==0.21.0` which requires torch 2.6 (the pin is
+torch 2.2.2) — a conflict that only resolves on non-Linux because the cuda
+deps are `platform_system == "Linux"`-gated; (2) the pip flow runs
+`pip wheel <lib> --no-deps` then `pip install <lib> --no-index
+--find-links <cache>`, so torch's 11 Linux-only nvidia wheels
+(nvrtc/cudnn/cublas/…) are never downloaded.
+
+Fix, both in the package:
+
+- **torchvision 0.21.0 → 0.17.2** in `requirements.json` (runtime, in the
+  launcher, when the seed file still has the upstream version).
+- **wrap the bundled `bin/python3`** at build time: a bash shim that strips
+  `--no-deps`/`--no-index` from argv and `exec -a "$0"` the real ELF. The
+  appanalyzer venv's `bin/python3` is a symlink to the bundled one, so the
+  venv inherits the wrapper on creation — no timing gap on first use. Only
+  Huawei's two pip invocations carry those flags, so every other call
+  (version probes, `-m venv`, user pip) passes through untouched.
+
+  Two traps: the shim must exec the **absolute** path to the real
+  `python3.12` — `dirname $0` resolves to the venv's `bin/` where
+  `python3.12 → python3` is a symlink loop (venv creation hangs); and it
+  must keep `exec -a "$0"` so Python still finds the venv's `pyvenv.cfg`
+  (otherwise pip installs into the bundled interpreter, which is
+  root-owned and unwritable).
+
+### codelinter needs a writable result dir
+
+`tools/codelinter/linter/result/` holds `codelinter.log`, `arkPerfCheck.log`,
+`hpauditTmp/`. The wrapper creates it and the linter writes into it on every
+run; with the dir at root:755 and stale root-owned 600 logs from a previous
+`sudo` run, a non-root user gets "failed to execute" with no log written.
+The package chmods the dir to 777; a fresh install starts empty so no stale
+files remain. (Root-owned 600 leftovers from manual sudo runs must be
+deleted locally.)
+
 ### `ohos-trace` plugin removal
 
 `plugins/ohos-trace` is deleted; it carries the "lemon" plugin bug (exit hang).
@@ -272,7 +490,148 @@ is deliberately **not** stripped (contains cross-compiled ARM binaries).
 ### UxTestService
 
 Mac-only tool in the DMG (Python, cross-platform). Comes from the DMG, not
-the CLI.
+the CLI. (The 26.0.0.821 Mac app still ships it under
+`Contents/tools/UxTestService`.)
+
+### app-analyzer moved to its own plugin (26.0.0.821)
+
+The apptest/appanalyzer jar set and its bundled Mach-O python moved from
+`plugins/harmony/lib/` to a dedicated `plugins/app-analyzer/` plugin. The
+PKGBUILD's python replacement and the wrapper's venv workaround now target
+`plugins/app-analyzer/lib/python`. Everything else (the case-symlink bridge,
+the venv-name 3.12.10 fallback, the pip wrapper) is unchanged.
+
+### arktsdoc (new in 26.0.0.821)
+
+An ArkTS documentation generator shipped in the CLI tools. `arktsdoc-deveco`
+resolves its root as `ARKTSDOC_HOME/../..` = `/opt/devecostudio`, so its
+`tools/node` + `sdk` paths are already correct. The main `arktsdoc` wrapper
+resolves `SHELLDIR/../..` = `/opt/devecostudio/tools` and references
+`tool/node` + `sdk` relative to that — the PKGBUILD rewrites them like
+codelinter's (`$ROOT_DIR/tool/node` → `$ROOT_DIR/node`, `$ROOT_DIR/sdk` →
+`$ROOT_DIR/../sdk`). Both are exposed via `tools/bin/arktsdoc`.
+
+### Dual SDK: 26.0.0 vs older (6.1.1 etc.)
+
+DevEco 26.0.0 shipped SDK components as Beta2 (`releaseType: Beta2`,
+26.0.0.32), so built artifacts declared `Beta2`. From 26.0.0.821 on, the
+bundled SDK is a **Release** one (26.0.0.105) — the default install
+produces `Release` artifacts and needs no patches. The extra-SDK machinery
+remains for older SDKs (e.g. 6.1.1 Release), switchable per project via
+`compileSdkVersion`.
+
+**Why the metadata edits failed (don't try again):**
+
+- Editing only `releaseType` in the component metadata has no effect because
+  hvigor's daemon caches component data, and the value is read from several
+  places (`sdk-pkg.json`, `openharmony/*/oh-uni-package.json`,
+  `hms/*/uni-package.json`).
+- Editing the version numbers too (`26.0.0.32` → `6.1.1.125`) breaks
+  version matching: `HosSdkInfoHandler.getLocalSdks()` filters local
+  components by `HosSdkVersion.equals(compileSdkVersion-derived)`; a
+  mismatch yields `SDK component missing`.
+
+**The blockers and where their patches live:**
+
+1. hvigor 26.0.0 validates the project's `compileSdkVersion` against
+   `VersionConst.SUPPORT_COMPILE_VERSION` (= `"26.0.0"`) in
+   `ValidateUtil.integrationVersionCheck()` (`validate-util.js`), rejecting
+   anything else with `UNSUPPORTED_COMPILESDKVERSION`.
+2. hvigor 6.26.4 (26.0.0.821) added `HmosSdkLoader.checkSdkVersionMatch`
+   (`hmos-sdk-loader.js`) which rejects any `compileSdkVersion` whose API
+   level differs from the latest support version with
+   `COMPILE_SDK_VERSION_MISMATCH` (00303313) — surfaced as "configured
+   version: 24, DevEco Studio version: 26.0.0"
+   (https://developer.huawei.com/.../ide-hvigor-errorcode-00303-1).
+3. The IDE's project sync (`HosIntegrationChecker.checkSameCompileSdkIfConfig`
+   in `plugins/harmony/lib/hos-project-mgmt-*.jar`) requires every product's
+   `compileSdkVersion` to equal the embedded SDK version (the max of
+   `sdk-hos-core-osVersionMapperV2.properties` = `"26.0.0"`) and aborts sync
+   with `SyncInterruptException` otherwise.
+
+All three checks are hardwired to the bundled SDK version, so **no patch is
+applied by default**. They live in `bin/patch-extra-sdk.sh` (idempotent,
+self-elevating via `sudo`), which is invoked from two places:
+
+- `bin/install-extra-sdk.sh`, right after it installs an older SDK;
+- `devecostudio.install` (`post_install`/`post_upgrade`) with `--auto`, and
+  the nfpm `scripts/postinstall.sh` for the deb/rpm builds. An upgrade
+  restores the pristine hvigor/IDE files, so without this a user's older-SDK
+  projects would silently stop syncing until they re-ran the installer by
+  hand.
+
+`--auto` no-ops unless an extra SDK is really installed: a directory under
+`/opt/devecostudio/sdk/` other than `default/` that contains both
+`sdk-pkg.json` **and** `openharmony/` (that predicate ignores leftover
+metadata-only backup dirs).
+
+The Python in both scripts is the one **inside the package**
+(`plugins/app-analyzer/lib/python/bin/python3.12`) — `python` is only a
+`makedepends`, and `.install` hooks run in a minimal environment where
+`python3` may not even be on `PATH`.
+
+The patches:
+
+- hvigor (`validate-util.js`): Python string replacement turning the
+  `printErrorExit` into `||void 0`
+  (pattern `...isEqualApiVersion)(r,s)&&...||void 0`);
+- hvigor (`hmos-sdk-loader.js`): same trick on
+  `o.fullVersion!==e&&_log.printErrorExit(...)` → `o.fullVersion!==e||void 0`;
+- IDE jar: single-byte patch in `HosIntegrationChecker.class` — the `ifne`
+  after `StringUtil.equals()` becomes `goto` (byte sequence
+  `b8 00 ad 9a 00 0b` → `b8 00 ad a7 00 0b`, verified identical in
+  26.0.0.621, 26.0.0.821 and 26.0.0.851), so the error notification is
+  never reached.
+
+All patches are idempotent and pattern-matched, so they keep no backup
+files — an earlier pair of `.orig` dumps under `hvigor-patch-backup/`
+(workspace root, never committed) has been dropped. The string patterns
+and the jar byte sequence were re-verified on 26.0.0.851 (hvigor 6.26.8) —
+unchanged from 6.26.4. A miss only warns; if you need the pristine file
+again, take it from the CLI zip
+(`command-line-tools/hvigor/hvigor-ohos-plugin/src/...`).
+
+The extra SDK is extracted with **bsdtar/unzip, not 7z**: 7z refuses the
+SDK's symlink chains (`libunwind.so → libunwind.so.1`, `clang →
+bisheng-clang`, `clang-cl → clang`, node's `bin/npm → ../lib/...`) as
+"Dangerous link via another link was ignored" and silently drops them,
+breaking the native toolchains (issue #10). The PKGBUILD's own DMG
+extraction still uses 7z — that path only feeds `.dmg` → `Contents` and has
+no such links.
+
+With the checks gone, hvigor scans the whole SDK root
+(`/opt/devecostudio/sdk/`) for components of any version and selects the
+set whose `HosSdkVersion` matches the project's `compileSdkVersion`. The
+artifact's `releaseType` follows the *selected SDK's own* metadata
+(6.1.1 → `Release`, 26.0.0 → `Release`) — no `getReleaseType` patch needed.
+
+**Installing the extra SDK** — `bin/install-extra-sdk.sh` (bundled, not on
+PATH): extracts `sdk/default/{openharmony,hms,sdk-pkg.json}` from a Huawei
+commandline-tools zip, reads the SDK's `data.path` (e.g. `HarmonyOS-6.1.1`)
+from `sdk-pkg.json` to name the destination directory, copies it under
+`/opt/devecostudio/sdk/<path>` with sudo, then calls
+`bin/patch-extra-sdk.sh`. The directory name comes from the zip, so the
+same script works for any version. If the target directory already exists
+it skips the copy and still runs the patches — that is the intended way to
+re-apply them after an upgrade (it used to `exit 1` there, so the old
+"re-run this script after a package upgrade" note was wrong).
+
+**Verified behavior** (26.0.0.621-9 and 26.0.0.821-1):
+
+| project compileSdkVersion | SDK used | artifact |
+|---|---|---|
+| `'6.1.1(24)'` | HarmonyOS-6.1.1 | `Release`, compileSdkVersion 6.1.1.125 |
+| `'26.0.0'` (or unset) | default | `Release`, compileSdkVersion 26.0.0.105 |
+
+**Caveats:**
+
+- After the patches are applied, restart any running hvigor daemon
+  (`pkill -f daemon-process-boot-script`) so the new code is loaded.
+- Code using API 26-only interfaces (e.g. `@ohos.multimedia.camera`
+  `VideoSession`/`PhotoSession` — 26.0.0 made `VideoSession` a superset of
+  `PhotoSession`; 6.1.1's `VideoSession` lacks the 5 manual-control mixins)
+  won't compile against 6.1.1; widen the declared type (e.g. `PhotoSession`
+  → `VideoSession`) or guard the calls.
 
 ## Runtime layout (installed)
 
@@ -294,10 +653,11 @@ the CLI.
 ├── build.txt
 ├── product-info.json           ← jq-transformed from DMG
 └── tools/
-    ├── bin/                    ← CLI wrappers (readlink-fixed)
+    ├── bin/                    ← CLI wrappers (readlink-fixed) + arktsdoc
     ├── node/ + lib/node_modules (2 symlinks above)
-    ├── hvigor/ ohpm/ hstack/ codelinter/ emulator/ UxTestService/
+    ├── hvigor/ ohpm/ hstack/ codelinter/ emulator/ arktsdoc/ UxTestService/
 /usr/bin/devecostudio → /opt/devecostudio/bin/devecostudio.sh
+/usr/bin/hdc → /opt/devecostudio/sdk/default/openharmony/toolchains/hdc (always)
 /usr/bin/{hvigorw,ohpm,hstack,hcodelinter,hemulator} (configurable)
 ```
 
@@ -311,6 +671,127 @@ The wrapper (devecostudio.sh) responsibilities, in order:
 
 ## Maintenance checklist
 
+### Shared build scripts (`scripts/`)
+
+The files that end up verbatim inside the package live in `scripts/` and
+are the single source of truth — the PKGBUILD references them via
+`$startdir/scripts/...` (makepkg cannot take subdirectory local sources):
+
+- `scripts/devecostudio.sh` — the launcher wrapper (HiDPI injection, X11
+  JCEF workaround, headless JCEF args, `~/Library/Huawei/Sdk` bridge,
+  appanalyzer requirements case-bridge + torchvision seed)
+- `scripts/install-extra-sdk.sh` — the extra-SDK installer (bsdtar/unzip
+  extraction, then calls `patch-extra-sdk.sh`); installed to
+  `bin/install-extra-sdk.sh`
+- `scripts/patch-extra-sdk.sh` — the three compileSdkVersion patches +
+  the `--auto` detection used by the upgrade hooks; installed to
+  `bin/patch-extra-sdk.sh`
+- `scripts/patch-previewer.py` — build-time patcher for hvigor's local
+  unit-test driver (fail fast instead of hanging); **not** shipped inside
+  the package, it runs from `package()`
+- `scripts/emulator-wrapper-patch.sh` — the license auto-accept block
+  `sed`-inserted into the Emulator wrapper
+- `scripts/python3-wrapper` — the pip `--no-deps`/`--no-index` stripping
+  shim installed as the bundled python3
+- `scripts/vmoptions.append` — the Linux-specific vmoptions lines appended
+  after the DMG's macOS vmoptions conversion
+
+They are NOT in `source=()` (no checksums): they are repo files like
+`devecostudio.desktop`, so edit + commit + rebuild. The standalone
+`build.sh` must reference the same files — never re-embed them.
+
+### Standalone build (`build.sh`) + nfpm packaging
+
+`build.sh` runs the PKGBUILD on any distribution without Arch/makepkg: it
+`source`s the PKGBUILD, stubs the makepkg macros (`msg2`/`error`/`warning`),
+sets `$srcdir`/`$pkgdir`/`$startdir` to `build/src`/`build/pkg`/the repo
+root, and calls `prepare` + `package`. This is the answer to the
+standalone build.sh from PR #11 — no 700-line port, the PKGBUILD stays
+the single source of truth. **Rule: the PKGBUILD must only use the
+`msg2`/`error`/`warning` macros and the `srcdir`/`pkgdir`/`startdir`
+variables** — introducing another makepkg-only macro breaks standalone
+builds.
+
+Two modes:
+
+- **Full build** (default): extracts the sources, downloads IDEA + CPython
+  (cached under `build/downloads/`, checksums read by position from the
+  PKGBUILD's `sha256sums` — #3 idea, #5 cpython), then runs
+  `prepare` + `package`. `--clean` forces re-extraction.
+- **`--stage=DIR`**: package an existing staging tree (e.g. makepkg's
+  `pkg/`) without building. This is what the GitHub Actions workflow uses
+  after `makepkg` — no duplicated build.
+
+Both modes produce the distro-agnostic tarball
+(`devecostudio-<ver>-linux-x86_64.tar.gz`, `gzip -1` for speed — the same
+compression the workflow uses) unless `--no-tarball` is given, plus
+optionally `.deb`/`.rpm` with **nfpm** (`--deb`/`--rpm`). `-h`/`--help`
+prints usage.
+
+What build.sh does beyond makepkg:
+
+- Extracts the sources itself (bsdtar/unzip for zips — 7z would drop the
+  SDK symlinks — and tar for the IDEA/CPython tarballs).
+- Copies `devecostudio.desktop` into `$srcdir` (makepkg does that for
+  local sources).
+- nfpm packaging: `nfpm.yaml` maps dependencies per format
+  (`overrides: deb/rpm` — Debian names vs Fedora names like
+  `libXScrnSaver`, `pulseaudio-libs`, `libxcrypt-compat`), `type: tree`
+  pulls in the whole `/opt/devecostudio` tree, and the `/usr/bin`
+  symlinks are declared individually. `scripts/postinstall.sh` runs
+  `update-desktop-database` for both deb and rpm scriptlets **and**
+  `patch-extra-sdk.sh --auto`, so deb/rpm get the same
+  re-apply-the-patches-on-upgrade behaviour as pacman's `devecostudio.install`.
+
+Pitfalls learned:
+
+- nfpm 2.47 does **not** expand `{{ .Env.X }}` templates in the config
+  (version ends up literal in metadata) — `build.sh` pre-renders with
+  `envsubst` (`version: "${PKGVER}"`), which requires gettext.
+- The staging tree from build.sh differs from makepkg's only by the SDK's
+  static libraries (`*.a`): makepkg's fakeroot tidy removes 177 of them
+  (SDK BiSheng `libc++.a` etc.), build.sh keeps them. No functional impact
+  (static libs are link-time only).
+
+### CI artifacts (GitHub Actions)
+
+The workflow does **not** use a `container:` block: GitHub's
+non-privileged containers lack `CAP_SYS_ADMIN`, so `swapon` fails with
+`Operation not permitted`, and the runner's own swap is only 3 GB — while
+the nfpm rpm packager builds the whole cpio payload in memory and peaks at
+~16 GB RSS (measured). Instead:
+
+- the job runs on the host and adds a 14 GB swapfile with sudo
+  (`/ci.swap`; `fallocate` — the kernel rejects *sparse* swap files with
+  "contains holes"); the host has 15 GB RAM, so the build has ~29 GB.
+  Verified: a `docker run` container inherits the host's swap.
+- the actual build runs inside `docker run --rm -v $GITHUB_WORKSPACE:/work
+  archlinux:base-devel`: `makepkg -sf` (**no `-c`** — `--clean` removes
+  `pkg/`, which the packaging step needs) as a non-root `builder` user,
+  then `/work/build.sh --stage=pkg/devecostudio ...` (tarball + nfpm
+  deb/rpm from the same tree). nfpm is not in the Arch repos, so it is
+  downloaded from the GitHub release (`nfpm_2.47.0_Linux_x86_64.tar.gz`,
+  version pinned — update deliberately).
+
+The run is trimmed by four boolean inputs — `make_arch`, `make_deb`,
+`make_rpm`, `make_tarball` (all on by default):
+
+- `make_arch=false` adds `makepkg --noarchive`: the Arch package is not
+  needed, only the staging tree the other formats are made from, so the
+  zstd step is skipped.
+- `make_deb`/`make_rpm=false` skips the nfpm download and that format;
+  `make_rpm=false` also skips the 14 GB swapfile step, since nothing else
+  peaks near the runner's RAM.
+- `make_tarball=false` passes `--no-tarball`, dropping the 4 GB gzip.
+
+Artifacts are uploaded **separately** (not one giant bundle) so users
+only download what they need; each is ~3–4 GB:
+
+- `devecostudio-arch` — `.pkg.tar.zst`
+- `devecostudio-deb` — `.deb`
+- `devecostudio-rpm` — `.rpm`
+- `devecostudio-tarball` — `.tar.gz`
+
 ### New DevEco Studio release
 
 1. Get the new `devecostudio-mac-<v>.zip` + `commandline-tools-linux-x64-<v>.zip`
@@ -323,6 +804,13 @@ The wrapper (devecostudio.sh) responsibilities, in order:
    and removed `lib/modules` + `lib/cds`, and added
    `lib/skiko-awt-runtime-all` and `tools/dumpParser` (Mach-O, excluded).
 3. Update `pkgver`, `_ideaver`, and the two Huawei zip `sha256sums`.
+   Also confirm the four patch patterns still match — hvigor
+   `validate-util.js`, hvigor `hmos-sdk-loader.js`, the
+   `hos-project-mgmt-*.jar` byte sequence (via
+   `bin/patch-extra-sdk.sh`) and the previewer driver (via
+   `scripts/patch-previewer.py`). All of them warn rather than fail, so
+   read the build output: a silent "pattern not found" means the older-SDK
+   or fail-fast behaviour is gone.
 4. `makepkg -f`, install, and run the test checklist below.
 
 ### Test checklist (after build)
@@ -335,6 +823,10 @@ The wrapper (devecostudio.sh) responsibilities, in order:
 - [ ] All five CLI tools: `hvigorw --version`, `ohpm --version`,
       `hstack --version`, `hcodelinter --version`, `hemulator --version`
 - [ ] `hdc list targets` sees a running emulator
+- [ ] `hvigorw test` **fails fast** (seconds, with the "cannot run ArkTS
+      tests on Linux" hint) instead of hanging silently
+- [ ] With an extra SDK present, upgrading re-applies the patches — pacman
+      prints `Extra SDK detected (<name>) — re-applying hvigor/IDE patches`
 
 ### Release
 
@@ -360,6 +852,8 @@ The wrapper (devecostudio.sh) responsibilities, in order:
   scan for exec-bit detection.
 - **`ln -sf bin/*` from the wrong cwd** silently creates a broken
   `bin/*` symlink — always `(cd dir && ln -sf ...)`.
-- The `find "$_pkg" -name '*.sh' -delete` blanket rule is a footgun (SDK
-  content) — keep it scoped.
+- The `find "$_pkg/bin" ... -name '*.sh' -delete` cleanup rule is a footgun:
+  it has silently eaten our own `bin/*.sh` twice (`install-extra-sdk.sh`,
+  then `patch-extra-sdk.sh`). Each of our scripts needs an explicit
+  `-not -path`, and `package()` now asserts all three still exist.
 - Wayland: JCEF GPU process crashes; use the X11 workaround.

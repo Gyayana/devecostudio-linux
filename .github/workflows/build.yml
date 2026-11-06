@@ -13,21 +13,32 @@ on:
         description: 'Override pkgver (e.g. 6.1.1.280). Leave empty to use the value in PKGBUILD.'
         required: false
         default: ''
-      mac_zip_sha256:
-        description: 'SHA256 of the Mac zip. Leave empty to use the value in PKGBUILD.'
-        required: false
-        default: ''
-      cli_zip_sha256:
-        description: 'SHA256 of the commandline-tools zip. Leave empty to use the value in PKGBUILD.'
-        required: false
-        default: ''
+      make_arch:
+        description: 'Build the Arch package (.pkg.tar.zst)'
+        type: boolean
+        default: true
+      make_deb:
+        description: 'Build the .deb'
+        type: boolean
+        default: true
+      make_rpm:
+        description: 'Build the .rpm (slowest)'
+        type: boolean
+        default: true
+      make_tarball:
+        description: 'Build the distro-agnostic tarball'
+        type: boolean
+        default: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    container:
-      image: archlinux:base-devel
+    # No `container:` block: the non-privileged container cannot swapon
+    # (rpm packaging peaks at ~16 GB RSS), and the runner's own swap is
+    # only 3 GB. Instead run on the host, add swap with sudo, and do the
+    # actual build inside `docker run archlinux:base-devel` — the
+    # container inherits the host's memory + swap.
 
     steps:
       - name: Checkout repository
@@ -35,37 +46,24 @@ jobs:
         with:
           path: devecostudio
 
-      - name: Install dependencies
+      - name: Add swap on the host (rpm packaging needs ~16 GB RSS)
+        if: inputs.make_rpm
         run: |
-          pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm \
-            git \
-            jq \
-            p7zip \
-            sudo
+          # host job: the runner user has passwordless sudo; a real swapfile
+          # on the host is inherited by the build container below.
+          sudo rm -f /ci.swap
+          sudo fallocate -l 14G /ci.swap
+          sudo chmod 600 /ci.swap
+          sudo mkswap /ci.swap >/dev/null
+          sudo swapon /ci.swap
+          free -h
 
-      - name: Create build user
-        run: |
-          useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          chown -R builder:builder devecostudio
-
-      - name: Apply version and checksum overrides
+      - name: Apply pkgver override
         working-directory: devecostudio
         run: |
           if [[ -n "${{ inputs.pkgver }}" ]]; then
             sed -i "s/^pkgver=.*/pkgver=${{ inputs.pkgver }}/" PKGBUILD
             echo "pkgver overridden to ${{ inputs.pkgver }}"
-          fi
-          # sha256sums array line numbers: mac zip is the 1st entry, cli zip the 2nd
-          line=$(grep -n "^sha256sums=(" PKGBUILD | cut -d: -f1)
-          if [[ -n "${{ inputs.mac_zip_sha256 }}" ]]; then
-            sed -i "$((line+1))s|.*|  '${{ inputs.mac_zip_sha256 }}'|" PKGBUILD
-            echo "mac zip sha256 overridden"
-          fi
-          if [[ -n "${{ inputs.cli_zip_sha256 }}" ]]; then
-            sed -i "$((line+2))s|.*|  '${{ inputs.cli_zip_sha256 }}'|" PKGBUILD
-            echo "cli zip sha256 overridden"
           fi
 
       - name: Download source archives
@@ -81,34 +79,84 @@ jobs:
 
           wait
 
-      - name: Build package
+      - name: Build and package inside archlinux container
+        env:
+          MAKE_ARCH: ${{ inputs.make_arch }}
+          MAKE_DEB: ${{ inputs.make_deb }}
+          MAKE_RPM: ${{ inputs.make_rpm }}
+          MAKE_TARBALL: ${{ inputs.make_tarball }}
         run: |
-          runuser -u builder -- bash -c '
-            cd devecostudio
-            makepkg -sfc --noconfirm
+          # Everything in this step runs as root inside the container; the
+          # container inherits the host's memory + swap (added above).
+          docker run --rm -e MAKE_ARCH -e MAKE_DEB -e MAKE_RPM -e MAKE_TARBALL \
+            -v "$GITHUB_WORKSPACE":/work -w /work \
+            archlinux:base-devel bash -c '
+            set -e
+            echo "=== free -h (inside container) ==="
+            free -h
+            pacman -Syu --noconfirm
+            pacman -S --needed --noconfirm git jq p7zip sudo
+            useradd -m builder
+            echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+            chown -R builder:builder /work
+            # A run that skips the Arch package only needs the staging tree
+            # the other formats are made from, so --noarchive saves the zstd
+            # step. No -c either way: --clean removes pkg/.
+            makepkg_args=(-sf --noconfirm)
+            [[ $MAKE_ARCH == true ]] || makepkg_args+=(--noarchive)
+            runuser -u builder -- bash -c "
+              cd /work/devecostudio
+              makepkg ${makepkg_args[*]}
+            "
+            if [[ $MAKE_DEB == true || $MAKE_RPM == true ]]; then
+              # nfpm is not in the Arch repos; fetch the static binary from
+              # the GitHub release (pinned version; update deliberately).
+              curl -fL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz \
+                | tar xz -C /usr/local/bin nfpm
+              nfpm --version | grep -m1 GitVersion
+            fi
+            cd /work/devecostudio
+            if [[ -d pkg/devecostudio ]]; then
+              # --stage packages the existing makepkg tree; --deb/--rpm add
+              # the nfpm packages and --no-tarball drops the gzip step.
+              pkg_args=(--stage=pkg/devecostudio)
+              if [[ $MAKE_DEB == true ]]; then pkg_args+=(--deb); fi
+              if [[ $MAKE_RPM == true ]]; then pkg_args+=(--rpm); fi
+              if [[ $MAKE_TARBALL != true ]]; then pkg_args+=(--no-tarball); fi
+              ./build.sh "${pkg_args[@]}"
+            else
+              echo "pkg/devecostudio not found; skipping packages"
+            fi
           '
 
-      - name: Create tarball for other distributions
-        working-directory: devecostudio
-        run: |
-          if [[ -d pkg/opt/devecostudio ]]; then
-            # pkg/opt/devecostudio is the complete /opt/devecostudio tree;
-            # ship it as a distro-agnostic tarball so non-Arch users can
-            # extract it to /opt without a package manager. The .desktop
-            # file is included at the tarball root.
-            chmod -R u+rw pkg/opt/devecostudio
-            cp pkg/usr/share/applications/devecostudio.desktop pkg/opt/
-            ver=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
-            tar -C pkg/opt -czf "devecostudio-${ver}-linux-x86_64.tar.gz" devecostudio devecostudio.desktop
-            echo "Created devecostudio-${ver}-linux-x86_64.tar.gz"
-          else
-            echo "pkg/opt/devecostudio not found; skipping tarball"
-          fi
-
-      - name: Upload package
+      - name: Upload Arch package
+        if: inputs.make_arch
         uses: actions/upload-artifact@v4
         with:
-          name: devecostudio-pkg
-          path: |
-            devecostudio/*.pkg.tar.zst
-            devecostudio/devecostudio-*-linux-x86_64.tar.gz
+          name: devecostudio-arch
+          path: devecostudio/*.pkg.tar.zst
+          if-no-files-found: warn
+
+      - name: Upload Debian package
+        if: inputs.make_deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: devecostudio-deb
+          path: devecostudio/devecostudio_*.deb
+          if-no-files-found: warn
+
+      - name: Upload RPM package
+        if: inputs.make_rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: devecostudio-rpm
+          path: devecostudio/devecostudio-*.x86_64.rpm
+          if-no-files-found: warn
+
+      - name: Upload tarball
+        if: inputs.make_tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: devecostudio-tarball
+          path: devecostudio/devecostudio-*-linux-x86_64.tar.gz
+          if-no-files-found: warn
